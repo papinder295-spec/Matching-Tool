@@ -29,6 +29,11 @@ FIXED RULES (in par tool khud dhyan deta hai, UI se change nahi hote):
      tab skip ho jata hai).
   7. Fuzzy Score (Name aur agar available ho to Address) output me hamesha diya
      jayega.
+  8. Agar ek Direct ID ke against Name-match se MULTIPLE Good IDs aa rahe hain
+     aur Hierarchy (links table) se bhi disambiguate nahi ho pa raha, to
+     Address/PCCity ko tie-breaker ki tarah use kiya jayega: agar in multiple
+     candidates me se SIRF EK ka Address/PCCity bhi match karta hai, to usi ko
+     final match maan liya jayega ("Identified by Address/City Match").
 
 -------------------------------------------------------------------------------------
 DATA FILES (same folder me rakhna hai):
@@ -41,7 +46,7 @@ DATA FILES (same folder me rakhna hai):
 -------------------------------------------------------------------------------------
 SETUP (company laptop pr ek baar karna hai):
 -------------------------------------------------------------------------------------
-  pip install pandas sqlalchemy pyodbc thefuzz python-Levenshtein openpyxl
+  pip install pandas sqlalchemy pyodbc thefuzz python-Levenshtein openpyxl rapidfuzz
 
   Neeche CONFIG section me apna SQL Server / Database / column names check kar lena
   (Address / City column ka naam database schema k hisaab se alag ho sakta hai).
@@ -67,6 +72,14 @@ try:
 except ImportError:
     fuzz = None
 
+# rapidfuzz process.cdist -> ek hi call me pura batch (list vs list) fuzzy score
+# nikal deta hai (C-optimized), row-by-row .apply() se kaafi tez hai.
+try:
+    from rapidfuzz import process as rf_process, fuzz as rf_fuzz
+except ImportError:
+    rf_process = None
+    rf_fuzz = None
+
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
@@ -76,7 +89,7 @@ from tkinter import ttk, messagebox, filedialog
 # =====================================================================================
 
 DB_CONFIG = {
-    "SQL_SERVER": "QIG-WXOBOSDB501.analytics.moodys.net",
+    "SQL_SERVER": "QIG-WXRELADB501.analytics.moodys.net",
     "DATABASE": "bvdaffils",
     "ODBC_DRIVER": "ODBC Driver 17 for SQL Server",
 }
@@ -87,7 +100,7 @@ SCHEMA_CONFIG = {
     "ID_COL": "Id",
     "NAME_COL": "Name",
     "ADDRESS_COL": "Address",     # <-- adjust if different in your schema
-    "CITY_COL": "City",           # <-- adjust if different in your schema
+    "CITY_COL": "PCCity",         # <-- adjust if different in your schema
     "NRLINKS_COL": "NrLinks",
     "BRANCH_COL": "Branch",
     "FOREIGN_COL": "[Foreign]",
@@ -355,6 +368,10 @@ def make_clean_name_fn(entity_regex, suffix_map=None, mandatory_words=None):
         #         (e.g. LTD, GMBH, OY etc. hatenge pehle)
         if entity_regex is not None:
             cleaned = entity_regex.sub(" ", cleaned)
+            # Pattern hatane ke turant baad jo extra/double space reh jata hai
+            # usko yahin par clean kar dete hain (isse baad ke steps me bhi
+            # koi stray space carry forward nahi hoga)
+            cleaned = re.sub(r"\s+", " ", cleaned).strip()
 
         # Step 3: Remove special characters, keep only alphanumeric + spaces
         cleaned = re.sub(r"[^a-z0-9\s]", " ", cleaned)
@@ -524,6 +541,15 @@ def run_matching_pipeline(params, log_fn):
     good_df = df[df["Source"] == "Good"].copy()
     direct_df = df[df["Source"] == "Direct"].copy()
 
+    # ---- BLOCKING / GROUPING (Performance ka sabse important step) ----
+    # Har Direct ID ko PURE Good ID pool (e.g. 10 lakh records) ke against check
+    # karne ke bajaye, hum Good IDs ko unke Cleaned Name ke PEHLE WORD se groups
+    # (buckets) me bant dete hain -> "ABC Holding Limited", "ABC Trade Limited",
+    # "ABC Corp" -> teeno ka First_Word "abc" hai, to teeno EK hi group me aa jate
+    # hain. Ab jab "ABC Ltd" wali Direct ID aati hai, uska bhi First_Word "abc"
+    # nikaal ke SEEDHA usi chhote group (na ki poore 10 lakh records) me fuzzy
+    # match dhoonda jata hai. Isse effective comparison O(N x M) na hoke
+    # O(N x avg_group_size) ho jata hai - bahut fast.
     good_df["First_Word"] = good_df["Cleaned Name"].apply(lambda x: x.split()[0] if x else None)
     direct_df["First_Word"] = direct_df["Cleaned Name"].apply(lambda x: x.split()[0] if x else None)
 
@@ -565,15 +591,29 @@ def run_matching_pipeline(params, log_fn):
             })
             continue
 
-        candidates["Name_Score"] = candidates["Cleaned Name"].apply(lambda x: fuzz.ratio(c_name, x))
+        # ---- Name scoring (group ke andar hi, chhota sa candidate set) ----
+        # rapidfuzz.process.cdist ek single vectorized/C-level call me pure batch
+        # ka score nikal deta hai - row-by-row .apply() se kaafi tez hai, khaaskar
+        # jab groups bade ho (e.g. common first words jaise "global", "the" etc.)
+        cand_names = candidates["Cleaned Name"].tolist()
+        if rf_process is not None:
+            candidates["Name_Score"] = rf_process.cdist([c_name], cand_names, scorer=rf_fuzz.ratio)[0]
+        else:
+            candidates["Name_Score"] = [fuzz.ratio(c_name, x) for x in cand_names]
 
         # Address rule: agar Direct ke paas address hai AND candidate ke paas bhi hai,
         # to address score bhi threshold pura karna hoga. Direct ke paas address na ho
         # to sirf Name match kaafi hai.
         if has_addr:
-            candidates["Address_Score"] = candidates.apply(
-                lambda r: fuzz.ratio(c_addr, r["Cleaned Address"]) if r["Has_Address"] else None, axis=1
-            )
+            cand_addrs = candidates["Cleaned Address"].tolist()
+            cand_has_addr = candidates["Has_Address"].tolist()
+            if rf_process is not None:
+                raw_addr_scores = rf_process.cdist([c_addr], cand_addrs, scorer=rf_fuzz.ratio)[0]
+            else:
+                raw_addr_scores = [fuzz.ratio(c_addr, x) for x in cand_addrs]
+            candidates["Address_Score"] = [
+                score if has else None for score, has in zip(raw_addr_scores, cand_has_addr)
+            ]
         else:
             candidates["Address_Score"] = None
 
@@ -609,8 +649,13 @@ def run_matching_pipeline(params, log_fn):
     if not all_matches_df.empty:
         for did, group in all_matches_df.groupby("Direct ID"):
             filtered = apply_hierarchy_filter(group, parent_map, child_map)
-            
-            # Agar ek hi match filter hoke aaya (ya toh ek hi tha, ya hierarchy ne sirf ek ko chuna)
+
+            # Agar Hierarchy Link se disambiguate nahi hua (abhi bhi multiple
+            # matches hain), to Address/PCCity ko tie-breaker ki tarah try karo
+            if len(filtered) > 1:
+                filtered = apply_address_filter(filtered, addr_threshold)
+
+            # Agar ek hi match filter hoke aaya (ya toh ek hi tha, ya hierarchy/address ne sirf ek ko chuna)
             if len(filtered) == 1:
                 single_match_list.append(filtered.iloc[0].to_dict())
             # Agar abhi bhi multiple matches hain, toh tie-break mat karo, sabko multi-match me daal do
@@ -631,14 +676,19 @@ def run_matching_pipeline(params, log_fn):
 
     if not single_match_df.empty:
         hierarchy_matches = single_match_df[single_match_df["Validation_Message"].str.contains("Link", na=False)]
-        fuzzy_matches = single_match_df[~single_match_df["Validation_Message"].str.contains("Link", na=False)]
+        address_matches = single_match_df[single_match_df["Validation_Message"].str.contains("Address/City", na=False)]
+        fuzzy_matches = single_match_df[
+            ~single_match_df["Validation_Message"].str.contains("Link", na=False)
+            & ~single_match_df["Validation_Message"].str.contains("Address/City", na=False)
+        ]
         hierarchy_out = get_clean_df(hierarchy_matches)
+        address_out = get_clean_df(address_matches)
         fuzzy_out = get_clean_df(fuzzy_matches)
         high_score_no_link = get_clean_df(
             single_match_df[(single_match_df["Name Fuzzy Score"] >= 95) & (single_match_df["Direct NrLinks"] == 0)]
         )
     else:
-        hierarchy_out = fuzzy_out = high_score_no_link = pd.DataFrame(columns=final_export_cols)
+        hierarchy_out = address_out = fuzzy_out = high_score_no_link = pd.DataFrame(columns=final_export_cols)
 
     multi_match_out = get_clean_df(multi_match_df) if not multi_match_df.empty else pd.DataFrame(columns=final_export_cols)
 
@@ -649,6 +699,7 @@ def run_matching_pipeline(params, log_fn):
     log_fn(f"Saving output to: {output_path}")
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         hierarchy_out.to_excel(writer, sheet_name="Hierarchy Matches", index=False)
+        address_out.to_excel(writer, sheet_name="Address-City Matches", index=False)
         fuzzy_out.to_excel(writer, sheet_name="Fuzzy Matches", index=False)
         high_score_no_link.to_excel(writer, sheet_name="High Score No Link", index=False)
         multi_match_out.to_excel(writer, sheet_name="Multi Match", index=False)
@@ -692,6 +743,33 @@ def apply_hierarchy_filter(group, parent_map, child_map):
         return group.assign(Validation_Message="Single Match (No Hierarchy)")
     else:
         return group.assign(Validation_Message="Multiple Matches (No Hierarchy)")
+
+
+def apply_address_filter(group, addr_threshold):
+    """
+    ADDRESS / PCCITY CHECK (Hierarchy Validation jaisa hi ek disambiguation step):
+
+    Agar Name-match ke baad (aur Hierarchy Link se) bhi ek Direct ID ke against
+    MULTIPLE Good IDs match kar rahe hain, to Address/PCCity ko tie-breaker
+    ki tarah use karo:
+      - Un candidates me se sirf wahi count karo jinka Address Fuzzy Score
+        addr_threshold se >= hai.
+      - Agar aisa SIRF EK hi candidate hai (baaki sab address pe match nahi
+        karte), to usi ko sahi match maan lo -> "Identified by Address/City Match"
+      - Agar 0 ya 1 se zyada candidates address pe bhi qualify karte hain,
+        to ambiguity waise hi rehne do (group ko unchanged return karo) taaki
+        wo Multi Match sheet me hi jaye - galat tie-break na ho.
+    """
+    if len(group) <= 1:
+        return group
+
+    addr_scores_numeric = pd.to_numeric(group["Address Fuzzy Score"], errors="coerce")
+    qualifying = group[addr_scores_numeric >= addr_threshold]
+
+    if len(qualifying) == 1:
+        return qualifying.assign(Validation_Message="Identified by Address/City Match")
+
+    return group
 
 
 # =====================================================================================
